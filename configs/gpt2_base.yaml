@@ -1,0 +1,12 @@
+model_name: gpt2 #distilgpt2
+use_fp16: true
+seed: 42
+max_seq_len: 256
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: ["c_attn", "c_proj", "c_fc"] 
+quant:
+  weight_per_channel: true
+  activation_observer: ema

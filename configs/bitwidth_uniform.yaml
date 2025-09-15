@@ -1,0 +1,4 @@
+name: uniform8
+per_layer_bits:
+  default_weight_bits: 8
+  default_activation_bits: 8

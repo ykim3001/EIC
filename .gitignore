@@ -1,0 +1,13 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+
+# data & artifacts
+data/
+checkpoints/
+*.pt
+*.bin
+*.safetensors

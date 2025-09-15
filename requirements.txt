@@ -1,0 +1,10 @@
+torch>=2.2
+transformers>=4.43
+accelerate>=0.33
+datasets>=2.20
+peft>=0.11
+evaluate>=0.4
+scikit-learn>=1.4
+numpy>=1.26
+pyyaml>=6.0
+rich>=13.7

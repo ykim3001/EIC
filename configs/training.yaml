@@ -1,0 +1,17 @@
+train:
+  total_steps: 300        # 1000
+  lr: 2.0e-4
+  warmup_steps: 10
+  weight_decay: 0.0
+  batch_size_per_device: 2  # 4
+  grad_accum_steps: 1 
+  mixed_precision: fp16
+  clip_grad: 1.0
+
+switchable:
+  configs: ["configs/bitwidth_uniform.yaml", "configs/bitwidth_mixed_small.yaml"]
+  schedule: "round_robin"
+
+cyclic:
+  cycle_every_steps: 50
+  order: ["uniform8", "mixed8648"]

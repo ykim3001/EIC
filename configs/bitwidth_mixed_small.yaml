@@ -1,0 +1,10 @@
+name: mixed8648
+per_layer_bits:
+  embedding: {w: 8, a: 8}
+  attn_qkv: {w: 6, a: 8}
+  attn_out: {w: 6, a: 8}
+  mlp_in: {w: 4, a: 8}
+  mlp_out: {w: 6, a: 8}
+  lm_head: {w: 8, a: 8}
+  default_weight_bits: 8
+  default_activation_bits: 8
