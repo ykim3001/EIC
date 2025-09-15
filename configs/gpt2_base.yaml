@@ -1,4 +1,4 @@
-model_name: gpt2 #distilgpt2
+model_name: gpt2
 use_fp16: true
 seed: 42
 max_seq_len: 256
