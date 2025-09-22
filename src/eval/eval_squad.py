@@ -43,69 +43,74 @@ def make_prompt(q: str, c: str) -> str:
 
 @torch.no_grad()
 def eval_profile(model, tok, ds, profile_name: str, profile_cfg: dict, max_examples: int, device):
-    bits = profile_cfg.get("per_layer_bits", profile_cfg)
-    bits = dict(bits); bits["name"] = profile_name
-    model.set_bits_profile(bits)
-    model.eval()
-
+    from math import ceil
+    import evaluate, re
     gen_cfg = GenerationConfig(
-        max_new_tokens=16,
+        max_new_tokens=6,   # shorter == faster
         do_sample=False,
         num_beams=1,
         pad_token_id=tok.eos_token_id,
         eos_token_id=tok.eos_token_id,
     )
 
-    try:
-        import evaluate
-        squad_metric = evaluate.load("squad")
-        use_official = True
-    except Exception:
-        squad_metric = None
-        use_official = False
+    # set bits & eval
+    bits = dict(profile_cfg.get("per_layer_bits", profile_cfg))
+    bits["name"] = profile_name
+    model.set_bits_profile(bits)
+    model.eval()
 
+    # Fewer examples for speed
     n = min(max_examples, len(ds))
-    em_hits = 0
-    preds, refs = [], []
+    ctx_cap = int(os.getenv("EVAL_CTX_CAP", "96"))
 
-    ctx_cap = int(os.getenv("EVAL_CTX_CAP", "160"))
-
+    # Pre-build prompts
+    prompts = []
+    qids, golds_all = [], []
     for i in range(n):
         ex = ds[i]
-        q = ex["question"]
-        c = ex["context"]
+        q, c = ex["question"], ex["context"]
         golds = ex.get("answers", {}).get("text", [""])
         qid = ex.get("id", str(i))
-
         enc_c = tok(c, add_special_tokens=False)
         c_short = tok.decode(enc_c["input_ids"][:ctx_cap])
+        prompt = (
+            "Answer the question in 1-3 words. If unanswerable, say 'unknown'.\n"
+            "question: Who wrote Hamlet?\n"
+            "context: William Shakespeare wrote many plays.\n"
+            "answer: William Shakespeare\n\n"
+            f"Answer the question in 1-3 words. If unanswerable, say 'unknown'.\n"
+            f"question: {q}\ncontext: {c_short}\nanswer:"
+        )
+        prompts.append(prompt)
+        qids.append(qid)
+        golds_all.append(golds)
 
-        prompt = EXEMPLAR + make_prompt(q, c_short)
-        enc = tok(prompt, return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-
+    # Batch tokenize
+    bs = 32  # tune based on VRAM
+    preds = []
+    for b in range(0, len(prompts), bs):
+        chunk = prompts[b:b+bs]
+        enc = tok(chunk, return_tensors="pt", padding=True, truncation=True).to(device)
+        # GPT-2 generate
         out = model.model.generate(**enc, generation_config=gen_cfg)
-        gen = tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+        # Slice out the generated tails
+        input_lens = enc["input_ids"].shape[1]
+        gens = tok.batch_decode(out[:, input_lens:], skip_special_tokens=True)
+        for g in gens:
+            pred = g.split("\n")[0].strip()
+            pred = re.split(r"(?:question:|context:|answer:)", pred)[0].strip()
+            preds.append(pred)
 
-        pred = gen.split("\n")[0].strip()
-        # If the model rambles, cut at field tokens
-        pred = re.split(r"(?:question:|context:|answer:)", pred)[0].strip()
+    # Compute SQuAD metric once
+    squad_metric = evaluate.load("squad")
+    pred_records = [{"id": qids[i], "prediction_text": preds[i]} for i in range(len(preds))]
+    ref_records  = [{"id": qids[i], "answers": {"text": golds_all[i], "answer_start": [0]*len(golds_all[i])}}
+                    for i in range(len(preds))]
+    scores = squad_metric.compute(predictions=pred_records, references=ref_records)
+    em, f1 = scores["exact_match"], scores["f1"]
+    print(f"[{profile_name}] EM={em:.2f}  F1={f1:.2f}  (n={len(preds)})")
+    return {"profile": profile_name, "n": len(preds), "em": em, "f1": f1}
 
-        if use_official:
-            preds.append({"id": qid, "prediction_text": pred})
-            refs.append({"id": qid, "answers": {"text": golds, "answer_start": [0]*len(golds)}})
-        else:
-            em_hits += exact_match(pred, golds)
-
-    if use_official:
-        scores = squad_metric.compute(predictions=preds, references=refs)
-        em, f1 = scores["exact_match"], scores["f1"]
-        print(f"[{profile_name}] EM={em:.2f}  F1={f1:.2f}  (n={n})")
-        return {"profile": profile_name, "n": n, "em": em, "f1": f1}
-    else:
-        em = 100.0 * em_hits / n if n else 0.0
-        print(f"[{profile_name}] EM={em:.2f}  (n={n})")
-        return {"profile": profile_name, "n": n, "em": em, "f1": None}
 
 def main():
     ap = argparse.ArgumentParser()

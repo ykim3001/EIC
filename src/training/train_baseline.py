@@ -35,9 +35,15 @@ def build_features(tokenizer, max_len, doc_stride):
     def prepare_train(examples):
         q = [s.strip() for s in examples["question"]]
         c = examples["context"]
-        enc = tokenizer(q, c, truncation="only_second", max_length=max_len,
-                        stride=doc_stride, return_overflowing_tokens=True,
-                        return_offsets_mapping=True, padding="max_length")
+        enc = tokenizer(
+            q, c,
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,  # we use it to compute spans...
+            padding="max_length",
+        )
         sample_map = enc.pop("overflow_to_sample_mapping")
         offsets = enc["offset_mapping"]
         seq_ids = [enc.sequence_ids(i) for i in range(len(enc["input_ids"]))]
@@ -49,13 +55,17 @@ def build_features(tokenizer, max_len, doc_stride):
             ans = examples["answers"][ex_idx]
             if len(ans["answer_start"]) == 0:
                 sp.append(cls_idx); ep.append(cls_idx); continue
-            s_char = ans["answer_start"][0]; e_char = s_char + len(ans["text"][0])
+
+            s_char = ans["answer_start"][0]
+            e_char = s_char + len(ans["text"][0])
             ids = seq_ids[i]
+
             k = 0
             while k < len(ids) and ids[k] != 1: k += 1
             c_start = k
             while k < len(ids) and ids[k] == 1: k += 1
             c_end = k - 1
+
             if not (off[c_start][0] <= s_char and off[c_end][1] >= e_char):
                 sp.append(cls_idx); ep.append(cls_idx)
             else:
@@ -63,23 +73,40 @@ def build_features(tokenizer, max_len, doc_stride):
                 while si <= c_end and off[si][0] <= s_char: si += 1
                 while ei >= c_start and off[ei][1] >= e_char: ei -= 1
                 sp.append(si - 1); ep.append(ei + 1)
-        enc["start_positions"] = sp; enc["end_positions"] = ep
+
+        enc["start_positions"] = sp
+        enc["end_positions"]   = ep
+
+        # 🔑 drop offsets so Trainer won't pass them to your model.forward()
+        enc.pop("offset_mapping", None)
+
         return enc
 
     def prepare_val(examples):
-        q = [s.strip() for s in examples["question"]]; c = examples["context"]
-        enc = tokenizer(q, c, truncation="only_second", max_length=max_len,
-                        stride=doc_stride, return_overflowing_tokens=True,
-                        return_offsets_mapping=True, padding="max_length")
+        q = [s.strip() for s in examples["question"]]
+        c = examples["context"]
+        enc = tokenizer(
+            q, c,
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,  # keep for post-processing
+            padding="max_length",
+        )
         sample_map = enc.pop("overflow_to_sample_mapping")
         enc["example_id"] = [examples["id"][i] for i in sample_map]
+
+        # mask non-context offsets so we never extract from question/special tokens
         for i in range(len(enc["input_ids"])):
             ids = enc.sequence_ids(i)
             enc["offset_mapping"][i] = [
                 (o if ids[k] == 1 else None) for k, o in enumerate(enc["offset_mapping"][i])
             ]
         return enc
+
     return prepare_train, prepare_val
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -125,10 +152,10 @@ def main():
         report_to=[],
         seed=args.seed,
         fp16=args.fp16,
-        remove_unused_columns=False,
         save_total_limit=1,
         save_strategy="epoch",
-        evaluation_strategy="no",
+        # evaluation_strategy="no",
+        remove_unused_columns=True,
     )
 
     trainer = Trainer(

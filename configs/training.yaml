@@ -1,10 +1,10 @@
 train:
-  total_steps: 300        # 1000
+  total_steps: 1000
   lr: 2.0e-4
   warmup_steps: 10
-  weight_decay: 0.0
-  batch_size_per_device: 2  # 4
-  grad_accum_steps: 1 
+  weight_decay: 0.01
+  batch_size_per_device: 4
+  grad_accum_steps: 2 
   mixed_precision: fp16
   clip_grad: 1.0
 

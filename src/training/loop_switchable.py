@@ -1,98 +1,95 @@
-import os, sys, time, math, yaml, itertools
-from dataclasses import dataclass
+# src/training/loop_switchable.py
+import os, sys, time, yaml, itertools
 import torch
-from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from datasets import load_from_disk
-from transformers import (AutoTokenizer, get_linear_schedule_with_warmup,
-                          DataCollatorForLanguageModeling)
-
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer, get_linear_schedule_with_warmup,
+    default_data_collator
+)
 from ..utils.logging import set_seed, get_logger
-from ..modeling.gpt2_patch import GPT2QuantModel
+from ..modeling.gpt2_qa import GPT2QuantForQA
 
-def load_squad_text_dataset(path="./data/squad"):
-    ds = load_from_disk(path)
-    def _fmt(example):
-        q = example.get("question","").strip()
-        c = example.get("context","").strip()
-        ans_list = example.get("answers",{}).get("text", [])
-        a = (ans_list[0] if ans_list else "").strip()
-        example["text"] = f"question: {q}\ncontext: {c}\nanswer: {a}\n"
-        return example
-    ds = ds.map(_fmt, remove_columns=[c for c in ds["train"].column_names if c != "text"])
-    return ds
-
-def tokenize_ds(ds, tokenizer, max_len=512):
-    def _tok(batch):
-        return tokenizer(
-        batch["text"],
-        truncation=True,
-        max_length=max_len,
-        padding="max_length",
-        )
-    return ds.map(_tok, batched=True, remove_columns=["text"])
+def load_yaml(p):
+    with open(p, "r") as f:
+        return yaml.safe_load(f)
 
 def pick_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
+    if torch.cuda.is_available(): return torch.device("cuda")
     if torch.backends.mps.is_available():
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         return torch.device("mps")
     return torch.device("cpu")
 
-def load_yaml(p): 
-    with open(p, "r") as f: 
-        return yaml.safe_load(f)
+def build_features(tokenizer, max_len, doc_stride):
+    # train set: create start/end positions; drop offset_mapping
+    def prepare_train(ex):
+        q = [s.strip() for s in ex["question"]]
+        c = ex["context"]
+        enc = tokenizer(
+            q, c,
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+        sample_map = enc.pop("overflow_to_sample_mapping")
+        offsets = enc["offset_mapping"]
+        seq_ids = [enc.sequence_ids(i) for i in range(len(enc["input_ids"]))]
 
-def train_switchable(model, dataloader, profiles, total_steps, lr, warmup, wd, grad_accum, device, logger, clip=1.0):
-    model.to(device)
-    model.train()
-    opt = AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    sch = get_linear_schedule_with_warmup(opt, warmup, total_steps)
+        sp, ep = [], []
+        for i, off in enumerate(offsets):
+            cls_idx = 0
+            ex_idx = sample_map[i]
+            ans = ex["answers"][ex_idx]
+            if len(ans["answer_start"]) == 0:
+                sp.append(cls_idx); ep.append(cls_idx); continue
+            s_char = ans["answer_start"][0]
+            e_char = s_char + len(ans["text"][0])
+            ids = seq_ids[i]
+            k = 0
+            while k < len(ids) and ids[k] != 1: k += 1
+            c_start = k
+            while k < len(ids) and ids[k] == 1: k += 1
+            c_end = k - 1
+            if not (off[c_start][0] <= s_char and off[c_end][1] >= e_char):
+                sp.append(cls_idx); ep.append(cls_idx)
+            else:
+                si, ei = c_start, c_end
+                while si <= c_end and off[si][0] <= s_char: si += 1
+                while ei >= c_start and off[ei][1] >= e_char: ei -= 1
+                sp.append(si - 1); ep.append(ei + 1)
+        enc["start_positions"] = sp
+        enc["end_positions"]   = ep
+        enc.pop("offset_mapping", None)   # important: not needed for training
+        return enc
 
-    step = 0
-    data_iter = itertools.cycle(dataloader)
-    prof_cycle = itertools.cycle(profiles)
-
-    t0 = time.time()
-    while step < total_steps:
-        pname, prof = next(prof_cycle)
-        model.set_bits_profile(prof)
-
-        opt.zero_grad(set_to_none=True)
-        loss_accum = 0.0
-        for _ in range(grad_accum):
-            batch = next(data_iter)
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-            out = model(**batch)             
-            logits = out.logits               
-            labels = batch["labels"]         
-
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-
-            (loss / grad_accum).backward()
-            loss_accum += float(loss.detach())
-
-        clip_grad_norm_(model.parameters(), clip)
-        opt.step(); sch.step()
-        step += 1
-
-        if step % 20 == 0 or step == total_steps:
-            dt = time.time() - t0
-            logger.info(f"step {step}/{total_steps} | profile={pname} | loss={loss_accum:.4f} | tok/s ~ (n/a) | elapsed {dt:.1f}s")
-
-    os.makedirs("./checkpoints", exist_ok=True)
-    torch.save(model.state_dict(), "./checkpoints/last.pt")
-    logger.info("Saved checkpoint to ./checkpoints/last.pt")
+    # val set: keep offset_mapping masked to context (for postprocess)
+    def prepare_val(ex):
+        q = [s.strip() for s in ex["question"]]
+        c = ex["context"]
+        enc = tokenizer(
+            q, c,
+            truncation="only_second",
+            max_length=max_len,
+            stride=doc_stride,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+        sample_map = enc.pop("overflow_to_sample_mapping")
+        enc["example_id"] = [ex["id"][i] for i in sample_map]
+        for i in range(len(enc["input_ids"])):
+            ids = enc.sequence_ids(i)
+            enc["offset_mapping"][i] = [
+                (o if ids[k] == 1 else None)
+                for k, o in enumerate(enc["offset_mapping"][i])
+            ]
+        return enc
+    return prepare_train, prepare_val
 
 def main():
     import argparse
@@ -104,62 +101,116 @@ def main():
     base = load_yaml(args.base_cfg)
     train = load_yaml(args.train_cfg)
 
-    logger = get_logger("eic")
+    logger = get_logger("eic-span")
     set_seed(base.get("seed", 42))
 
     model_name = base.get("model_name", "gpt2")
-    max_len = base.get("max_seq_len", 512)
+    max_len    = int(base.get("max_seq_len", 384))
+    doc_stride = int(base.get("doc_stride", 128))
 
-    tok = AutoTokenizer.from_pretrained(model_name)
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
+    tok.padding_side = "right"   # for extractive QA
 
-    ds = load_squad_text_dataset("./data/squad")
-    ds_tok = tokenize_ds(ds, tok, max_len=max_len)
-    frac = float(os.environ.get("SUBSET_FRAC", "0.2"))  # 20%
-    n = int(len(ds_tok["train"]) * frac)
-    ds_tok["train"] = ds_tok["train"].select(range(n))
-    collator = DataCollatorForLanguageModeling(tok, mlm=False)
-    bs = train["train"].get("batch_size_per_device", 4)
+    ds = load_dataset("squad")
+    prep_train, prep_val = build_features(tok, max_len, doc_stride)
+    train_features = ds["train"].map(prep_train, batched=True, remove_columns=ds["train"].column_names)
+    # (Optional) sub-sample for speed during dev:
+    frac = float(os.environ.get("SUBSET_FRAC", "1.0"))
+    if frac < 1.0:
+        n = int(len(train_features) * frac)
+        train_features = train_features.select(range(n))
+
+    collator = default_data_collator
+    bs = int(train["train"].get("batch_size_per_device", 4))
+
     dl = DataLoader(
-        ds_tok["train"],
+        train_features,
         batch_size=bs,
         shuffle=True,
         collate_fn=collator,
         drop_last=True,
-        num_workers=0,          
-        pin_memory=False,     
+        num_workers=0,
+        pin_memory=False,
     )
 
+    # Build profiles
     prof_files = train["switchable"]["configs"]
     profiles = []
     for pf in prof_files:
-        p = load_yaml(pf)
-        name = p.get("name") or os.path.splitext(os.path.basename(pf))[0]
-        prof = p.get("per_layer_bits", p)
+        y = load_yaml(pf)
+        name = y.get("name") or os.path.splitext(os.path.basename(pf))[0]
+        prof = y.get("per_layer_bits", y)
         prof["name"] = name
         profiles.append((name, prof))
 
+    # Model: quant backbone + span head
     init_prof = profiles[0][1]
-    model = GPT2QuantModel(model_name, init_prof)
+    model = GPT2QuantForQA(model_name=model_name, profile=init_prof)
+    model.backbone.model.config.pad_token_id = tok.pad_token_id
 
     device = pick_device()
+    model.to(device)
     logger.info(f"device={device} | model={model_name} | steps={train['train']['total_steps']} | profiles={[n for n,_ in profiles]}")
 
-    train_switchable(
-        model=model,
-        dataloader=dl,
-        profiles=profiles,
-        total_steps=train["train"]["total_steps"],
-        lr=train["train"].get("lr", 2e-4),
-        warmup=train["train"].get("warmup_steps", 100),
-        wd=train["train"].get("weight_decay", 0.01),
-        grad_accum=train["train"].get("grad_accum_steps", 2),
-        device=device,
-        logger=logger,
-        clip=train["train"].get("clip_grad", 1.0),
-    )
+    # Optim & sched
+    total_steps = int(train["train"]["total_steps"])
+    lr          = float(train["train"].get("lr", 3e-5))
+    wd          = float(train["train"].get("weight_decay", 0.01))
+    warmup      = int(train["train"].get("warmup_steps", 100))
+    grad_accum  = int(train["train"].get("grad_accum_steps", 1))
+    clip        = float(train["train"].get("clip_grad", 1.0))
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sch = get_linear_schedule_with_warmup(opt, warmup, total_steps)
+
+    step = 0
+    data_iter = itertools.cycle(dl)
+    prof_cycle = itertools.cycle(profiles)
+    t0 = time.time()
+
+    use_fp16 = str(base.get("use_fp16", False)).lower() in ("1","true","yes") and device.type=="cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+
+    model.train()
+    while step < total_steps:
+        pname, prof = next(prof_cycle)
+        model.set_bits_profile(prof)
+
+        opt.zero_grad(set_to_none=True)
+        loss_accum = 0.0
+
+        for _ in range(grad_accum):
+            batch = next(data_iter)
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            with torch.cuda.amp.autocast(enabled=use_fp16):
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    start_positions=batch["start_positions"],
+                    end_positions=batch["end_positions"],
+                )
+                loss = out.loss / grad_accum
+
+            scaler.scale(loss).backward()
+            loss_accum += float(loss.detach()) * grad_accum
+
+        if clip and clip > 0:
+            scaler.unscale_(opt)
+            clip_grad_norm_(model.parameters(), clip)
+        scaler.step(opt); scaler.update()
+        sch.step()
+
+        step += 1
+        if step % 20 == 0 or step == total_steps:
+            dt = time.time() - t0
+            logger.info(f"step {step}/{total_steps} | profile={pname} | loss={loss_accum:.4f} | elapsed {dt:.1f}s")
+
+    os.makedirs("./checkpoints", exist_ok=True)
+    torch.save(model.state_dict(), "./checkpoints/last.pt")
+    logger.info("Saved checkpoint to ./checkpoints/last.pt")
 
 if __name__ == "__main__":
     main()

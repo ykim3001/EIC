@@ -1,7 +1,7 @@
 model_name: gpt2
 use_fp16: true
 seed: 42
-max_seq_len: 256
+max_seq_len: 512
 lora:
   r: 8
   alpha: 16
